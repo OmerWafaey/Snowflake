@@ -1,0 +1,3 @@
+docker_command = f"""
+            docker run --rm -i --name {github_project['repo_name']} --entrypoint sh lubnaibrahimu/obelion-ansible:latest -c "
+            ansible-playbook -i /snowflake "

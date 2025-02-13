@@ -1,0 +1,199 @@
+- name: Deploy ChromaDB and Process Documents on EC2
+  hosts: ec2_instance
+  become: yes
+  tasks:
+
+    - name: Update apt packages
+      apt:
+        update_cache: yes
+
+    - name: Remove containerd and related packages
+      apt:
+        name:
+          - containerd
+          - containerd.io
+        state: absent
+        purge: yes
+
+    - name: Install Docker
+      apt:
+        name: docker.io=26.1.3-0ubuntu1~24.04.1
+        state: present
+
+    - name: Ensure Docker is running and enabled
+      service:
+        name: docker
+        state: started
+        enabled: yes
+
+    - name: Install Docker Compose Plugin
+      apt:
+        name: docker-compose-plugin
+        state: present
+
+    - name: Install Python dependencies
+      pip:
+        name:
+          - python3
+          - python3-pip
+          - python3-venv
+        state: present
+
+    - name: Create a directory for ChromaDB
+      file:
+        path: /opt/chromadb
+        state: directory
+        mode: '0755'
+
+    - name: Copy Docker Compose file
+      copy:
+        content: |
+          services:
+            chromadb:
+              image: chromadb/chroma
+              container_name: chromadb
+              ports:
+                - "8000:8000"
+              restart: always
+              command: uvicorn chromadb.app:app --host 0.0.0.0 --port 8000
+        dest: /opt/chromadb/docker-compose.yml
+
+    - name: Start ChromaDB using Docker Compose
+      shell: docker compose -f /opt/chromadb/docker-compose.yml up --force-recreate --build -d
+      args:
+        chdir: /opt/chromadb
+
+    - name: Install Python dependencies in the virtual environment
+      pip:
+        name:
+          - chromadb
+          - transformers
+          - torch
+          - pdfplumber
+          - python-docx
+        executable: /opt/venv/bin/pip
+
+    - name: Create directory for storing documents
+      file:
+        path: /home/ubuntu/Test-files
+        state: directory
+        mode: '0755'
+
+    - name: Create Python script for document processing
+      copy:
+        content: |
+          import os
+          import uuid
+          import logging
+          import chromadb
+          import time
+          from transformers import AutoTokenizer, AutoModel
+          import torch
+          import pdfplumber
+          from docx import Document
+
+          # إعداد الـ logging
+          logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+          logging.info("Starting the document processing script...")
+
+          # تحميل النموذج والتوكينيزر
+          tokenizer = AutoTokenizer.from_pretrained("Omartificial-Intelligence-Space/Arabic-Triplet-Matryoshka-V2")
+          model = AutoModel.from_pretrained("Omartificial-Intelligence-Space/Arabic-Triplet-Matryoshka-V2")
+
+          # دالة لتوليد الـ embeddings
+          def generate_embeddings(texts):
+              inputs = tokenizer(texts, padding=True, truncation=True, return_tensors="pt")
+              with torch.no_grad():
+                  outputs = model(**inputs)
+              embeddings = outputs.last_hidden_state.mean(dim=1)
+              return embeddings.tolist()
+
+          # دالة لتحميل النصوص من ملفات PDF
+          def load_documents_from_pdfs(directory):
+              documents = []
+              metadatas = []
+              for filename in os.listdir(directory):
+                  if filename.endswith('.pdf'):
+                      with pdfplumber.open(os.path.join(directory, filename)) as pdf:
+                          text = ''
+                          for page in pdf.pages:
+                              page_text = page.extract_text()
+                              if page_text:
+                                  text += page_text + "\n"
+                          if text:
+                              documents.append(text)
+                              metadatas.append({"source": filename})
+              return documents, metadatas
+
+          # دالة لتحميل النصوص من ملفات Word (docx)
+          def load_documents_from_docx(directory):
+              documents = []
+              metadatas = []
+              for filename in os.listdir(directory):
+                  if filename.endswith('.docx'):
+                      doc = Document(os.path.join(directory, filename))
+                      text = '\n'.join([para.text for para in doc.paragraphs])
+                      if text:
+                          documents.append(text)
+                          metadatas.append({"source": filename})
+              return documents, metadatas
+
+          # الاتصال بـ ChromaDB
+          chroma_client = chromadb.HttpClient(host="localhost", port=8000)
+          logging.info("Chroma Server Heartbeat: %s", chroma_client.heartbeat())
+
+          collection_name = "test-collection"
+
+          # التحقق من وجود الـ collection وإنشاؤها إذا لم تكن موجودة
+          try:
+              collection = chroma_client.get_collection(name=collection_name)
+              logging.info(f"Collection '{collection_name}' already exists.")
+          except Exception as e:
+              logging.info(f"Collection '{collection_name}' does not exist. Creating it...")
+              collection = chroma_client.create_collection(name=collection_name)
+              logging.info(f"Collection '{collection_name}' created.")
+
+          # تحميل النصوص من ملفات PDF و Word
+          directory = "/home/ubuntu/Test-files"
+          pdf_documents, pdf_metadatas = load_documents_from_pdfs(directory)
+          docx_documents, docx_metadatas = load_documents_from_docx(directory)
+
+          # دمج النصوص من ملفات PDF و Word
+          documents = pdf_documents + docx_documents
+          metadatas = pdf_metadatas + docx_metadatas
+
+          # التحقق مما إذا كانت هناك مستندات قبل تنفيذ المعالجة
+          if not documents:
+              logging.warning("No documents found to process. Skipping embeddings generation.")
+          else:
+              # إضافة metadata إضافية مثل تاريخ الرفع
+              for metadata in metadatas:
+                  metadata["upload_date"] = "2024-01-01"  # تاريخ افتراضي
+                  metadata["category"] = "example_category"  # تصنيف افتراضي
+
+              # توليد الـ embeddings
+              embeddings = generate_embeddings(documents)
+              ids = [str(uuid.uuid4()) for _ in range(len(documents))]
+
+              # إضافة البيانات إلى ChromaDB
+              try:
+                  collection.add(ids=ids, embeddings=embeddings, documents=documents, metadatas=metadatas)
+                  logging.info(f"Added {len(documents)} documents to the collection.")
+              except Exception as e:
+                  logging.error(f"Error adding documents: {e}")
+
+              # إجراء استعلام بحثي للتأكد من أن البيانات مخزنة بنجاح
+              query_text = "لفض البديلة الوسائل المنازعات"
+              query_embedding = generate_embeddings([query_text])
+
+              start_time = time.time()
+              results = collection.query(query_embeddings=query_embedding, n_results=10, include=["embeddings", "metadatas", "documents"])
+              end_time = time.time()
+
+              logging.info("Query Results: %s", results)
+              logging.info(f"Query took {end_time - start_time:.4f} seconds")
+        dest: /home/ubuntu/process_chromadb.py
+        mode: '0755'
+
+    - name: Run Python script to process documents
+      command: python3 /home/ubuntu/process_chromadb.py
