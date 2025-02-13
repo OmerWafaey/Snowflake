@@ -1,0 +1,3 @@
+command docker:
+docker build -t snowflake-ansible .
+docker run --rm snowflake-ansible
